@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { default: PQueue } = require('p-queue'); // Added for controlled concurrency
-const chokidar = require('chokidar'); // Added for file watching
+const watcher = require('./watcher'); // Importar el nuevo módulo de watcher
 
 // Configuration constants
 const MAX_DIRECTORY_LOAD_TIME = 300000; // 5 minutes timeout for large repositories
@@ -60,7 +60,7 @@ const DEFAULT_PATTERNS = [
 let currentIgnoreMode = 'automatic';
 let isLoadingDirectory = false;
 let loadingTimeoutId = null;
-let currentWatcher = null; // Added for file watching
+// Variable currentWatcher ya no es necesaria, se gestiona en el módulo watcher
 
 /**
  * @typedef {Object} DirectoryLoadingProgress
@@ -505,72 +505,67 @@ async function loadGitignore(rootDir, window) {
     });
 
     // Start file watcher after initial scan completes
-    if (chokidar) {
+    if (window) {
       try {
-        const watcherConfig = {
-          ignored: (filePath) => {
-            try {
-              // Safely handle empty paths
-              if (!filePath || filePath.trim() === '') {
-                console.warn('Empty path passed to watcher ignored function');
-                return true;
-              }
-              return shouldIgnorePath(filePath, rootDir, rootDir, ig);
-            } catch (error) {
-              console.error('Error in watcher ignore function:', error);
-              return true; // Ignore files that cause errors
+        // Crear función de ignorar para el observador
+        const ignoreFunction = (filePath) => {
+          try {
+            // Safely handle empty paths
+            if (!filePath || filePath.trim() === '') {
+              console.warn('Empty path passed to watcher ignored function');
+              return true;
             }
-          },
-          ignoreInitial: true,
-          awaitWriteFinish: {
-            stabilityThreshold: 2000,
-            pollInterval: 100,
-          },
-          persistent: true,
+            return shouldIgnorePath(filePath, rootDir, rootDir, ig);
+          } catch (error) {
+            console.error('Error in watcher ignore function:', error);
+            return true; // Ignore files that cause errors
+          }
         };
 
-        currentWatcher = chokidar.watch(rootDir, watcherConfig);
-
-        // Handle any setup errors
-        currentWatcher.on('error', (error) => {
-          console.error('File watcher encountered an error:', error);
-        });
-
-        // Setup event handlers with proper error handling
-        currentWatcher.on('add', async (filePath) => {
-          try {
-            const fileData = await processSingleFile(filePath, rootDir, ig);
-            if (fileData && window && !window.isDestroyed()) {
-              window.webContents.send('file-added', fileData);
+        // Definir manejadores de eventos para el observador
+        const watcherHandlers = {
+          onAdd: async (filePath) => {
+            try {
+              const fileData = await processSingleFile(filePath, rootDir, ig);
+              if (fileData && window && !window.isDestroyed()) {
+                window.webContents.send('file-added', fileData);
+              }
+            } catch (error) {
+              console.error(`Error processing added file ${filePath}:`, error);
             }
-          } catch (error) {
-            console.error(`Error processing added file ${filePath}:`, error);
-          }
-        });
-
-        currentWatcher.on('change', async (filePath) => {
-          try {
-            const fileData = await processSingleFile(filePath, rootDir, ig);
-            if (fileData && window && !window.isDestroyed()) {
-              window.webContents.send('file-updated', fileData);
+          },
+          onChange: async (filePath) => {
+            try {
+              const fileData = await processSingleFile(filePath, rootDir, ig);
+              if (fileData && window && !window.isDestroyed()) {
+                window.webContents.send('file-updated', fileData);
+              }
+            } catch (error) {
+              console.error(`Error processing changed file ${filePath}:`, error);
             }
-          } catch (error) {
-            console.error(`Error processing changed file ${filePath}:`, error);
-          }
-        });
-
-        currentWatcher.on('unlink', (filePath) => {
-          try {
-            if (window && !window.isDestroyed()) {
-              window.webContents.send('file-removed', {
-                path: normalizePath(filePath),
-                relativePath: safeRelativePath(rootDir, filePath),
-              });
+          },
+          onUnlink: (filePath) => {
+            try {
+              if (window && !window.isDestroyed()) {
+                window.webContents.send('file-removed', {
+                  path: normalizePath(filePath),
+                  relativePath: safeRelativePath(rootDir, filePath),
+                });
+              }
+            } catch (error) {
+              console.error(`Error handling deleted file ${filePath}:`, error);
             }
-          } catch (error) {
-            console.error(`Error handling deleted file ${filePath}:`, error);
+          },
+          onError: (error) => {
+            console.error('File watcher encountered an error:', error);
+          },
+          onReady: () => {
+            console.log(`File watcher ready for ${rootDir}`);
           }
-        });
+        };
+
+        // Iniciar el observador usando el nuevo módulo
+        await watcher.startWatcher(rootDir, ignoreFunction, watcherHandlers);
       } catch (watcherError) {
         console.error('Error setting up file watcher:', watcherError);
         // Continue without watcher rather than failing the whole operation
@@ -1148,19 +1143,16 @@ if (!ipcMain.eventNames().includes('set-ignore-mode')) {
     console.log(`[IgnoreMode] switched -> ${mode}`);
     console.log('[IgnoreMode] DEBUG - Current mode set to:', currentIgnoreMode);
 
+    // Clear caches
     ignoreCache.clear();
     fileCache.clear();
     fileTypeCache.clear();
 
-    if (currentWatcher) {
-      try {
-        await currentWatcher.close();
-        currentWatcher = null;
-      } catch (error) {
-        console.error('[IgnoreMode] Error closing file watcher:', error);
-      }
-    }
+    // Detener el observador al cambiar el modo de ignorar
+    await watcher.stopWatcher();
+    console.log('[IgnoreMode] File watcher stopped due to mode change');
 
+    // Notificar a todas las ventanas del cambio
     BrowserWindow.getAllWindows().forEach((win) => {
       if (win && win.webContents) {
         win.webContents.send('ignore-mode-updated', mode);
@@ -1354,9 +1346,7 @@ function createWindow() {
 
   // Clean up watcher when window is closed
   mainWindow.on('closed', () => {
-    if (currentWatcher) {
-      currentWatcher.close().then(() => console.log('File watcher closed.'));
-    }
+    watcher.stopWatcher().then(() => console.log('File watcher closed when window closed.'));
   });
 
   mainWindow.webContents.once('did-finish-load', () => {
@@ -1367,9 +1357,7 @@ function createWindow() {
 
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') {
-      if (currentWatcher) {
-        currentWatcher.close().then(() => console.log('File watcher closed before quit.'));
-      }
+      watcher.stopWatcher().then(() => console.log('File watcher closed before quit.'));
       app.quit();
     }
   });
